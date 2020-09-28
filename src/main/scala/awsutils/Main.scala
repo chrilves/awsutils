@@ -1,12 +1,20 @@
 package awsutils
 
+import java.time.ZonedDateTime
+import java.time.format.DateTimeFormatter
+
 import cats.effect.IO
 import shapeless.tag
 import software.amazon.awssdk.regions.Region
 import awsutils.aws._
+
 import scala.concurrent.ExecutionContext
 import awsutils.aws.AwsAPI._
-import awsutils.io.IOContext
+import awsutils.io.{FS, IOContext}
+
+import scala.concurrent.duration._
+import cats.instances.list._
+import cats.syntax.parallel._
 
 object Main {
   val defaultAwsConfig: AwsAPI.Config =
@@ -15,7 +23,8 @@ object Main {
       tag[AWSRateLimit](10L),
       tag[AWSRetries](3),
       tag[AWSChunkSize](200),
-      tag[AWSParallelism](20)
+      tag[AWSParallelism](20),
+      30.seconds
     )
 
   /** Resources needed for the application */
@@ -35,9 +44,10 @@ object Main {
         aws <- AwsAPI.Context.create(awsConfig)
         _ <- IO(println {
           s"""aws-concurrent-calls=${awsConfig.concurrentCalls}
-             |aws-reties=${awsConfig.retries}
+             |aws-retries=${awsConfig.retries}
              |aws-chunk-size=${awsConfig.chunkSize}
              |aws-parallelism=${awsConfig.parallelism}
+             |aws-wait-on-error=${awsConfig.waitOnError}
              |""".stripMargin
         })
       } yield Context(io, aws)
@@ -52,6 +62,7 @@ object Main {
       r <- {
         import CommandLine._
         import context.implicits._
+        import context.io.implicits._
         command match {
           case Help =>
             IO(println(s"${Console.GREEN}${usage}${Console.RESET}"))
@@ -61,8 +72,28 @@ object Main {
             AwsAPI.copyTable(src, dst)
           case Delete(_, src) =>
             AwsAPI.deleteTable(src)
+          case Monitor(_, items) =>
+            items.parTraverse_ {
+              case Monitor.Item(url, file, waitBetween) =>
+                FS.withFile(file).use { printLine =>
+                  printLine("timestamp,files,size") *>
+                    loop {
+                      for {
+                        timestamp <- IO(ZonedDateTime.now())
+                        stats     <- S3.objectsSize(url)
+                        line =
+                          s"${timestamp.format(DateTimeFormatter.ISO_LOCAL_DATE_TIME)},${stats.objects},${stats.size}"
+                        _ <- IO(println(line))
+                        _ <- printLine(line)
+                        _ <- IO.sleep(waitBetween)
+                      } yield ()
+                    }
+                }
+            }
         }
       }
     } yield r).unsafeRunSync()
   }
+
+  def loop(io: IO[Unit]): IO[Unit] = io.flatMap(_ => loop(io))
 }

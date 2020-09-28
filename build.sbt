@@ -50,7 +50,9 @@ lazy val globalSettings: Seq[sbt.Def.SettingsDefinition] =
       "org.typelevel" %% "cats-effect" % "2.1.4",
       "co.fs2" %% "fs2-core" % "2.4.0",
       "software.amazon.awssdk" % "s3" % "2.13.67",
-      "org.scalatest" %% "scalatest" % "3.2.0" % Test
+      "org.scalatest" %% "scalatest" % "3.2.2" % Test,
+      "org.scalacheck" %% "scalacheck" % "1.14.1" % Test,
+      "org.scalatestplus" %% "scalacheck-1-14" % "3.2.2.0" % Test
     )
   )
 

@@ -9,6 +9,7 @@ import awsutils.aws.{AwsAPI, S3TableURL}
 import awsutils.lib.CommandLineParser
 import shapeless.tag
 import awsutils.lib.CommandLineParser.{in, next, read}
+import scala.concurrent.duration._
 
 import scala.util.Try
 
@@ -20,45 +21,32 @@ object CommandLine {
     s"""AppEventsCompactor
        |
        |Usage:
-       |  command (-h|--help)                 : prints this help message
-       |  command CONFIG* copy   INPUT OUTPUT : copy table to.
-       |  command CONFIG* delete INPUT        : delete table.
+       |  command (-h|--help)                       : prints this help message
+       |  command CONFIG* copy   INPUT OUTPUT       : copy table to.
+       |  command CONFIG* delete INPUT              : delete table.
+       |  command CONFIG* monitor (INPUT CSV SECS)* : delete table.
        |
        |  INPUT  = s3://bucket/path/
        |  OUTPUT = s3://bucket/path/
+       |  CSV    = /path/to/csv/file
+       |  SECS   = integer representing seconds between two measures
        |
-       |  CONFIG = (-acc|--aws-concurrent-calls)  <integer > 0>
-       |         | (-ar |--aws-retries)           <integer > 0>
-       |         | (-acs|--aws-chunk-size)        <integer > 0> : size of delete requests
-       |         | (-ap |--aws-parallelism)       <integer > 0>
-       |         | (-scj|--spark-concurrent-jons) <integer > 0>
+       |  CONFIG = (-acc |--aws-concurrent-calls)  <integer >  0>
+       |         | (-ar  |--aws-retries)           <integer >  0>
+       |         | (-acs |--aws-chunk-size)        <integer >  0> : size of delete requests
+       |         | (-ap  |--aws-parallelism)       <integer >  0>
+       |         | (-awoe|--aws-wait-on-error)     <integer >= 0> : seconds
        |
        |""".stripMargin
 
   val pS3TableURL: CommandLineParser[S3TableURL] =
     next.filterMap(S3TableURL.fromURL)
 
-  val pPositiveInt: CommandLineParser[Int] =
-    next.filterMap { x =>
-      Try {
-        val r = x.toInt
-        if (r <= 0)
-          throw new Exception("Expected positive integer")
-        else
-          r
-      }
-    }
+  val pInt: CommandLineParser[Int] =
+    next.filterMap(x => Try(x.toInt))
 
-  val pPositiveLong: CommandLineParser[Long] =
-    next.filterMap { x =>
-      Try {
-        val r = x.toLong
-        if (r <= 0)
-          throw new Exception("Expected positive long")
-        else
-          r
-      }
-    }
+  val pLong: CommandLineParser[Long] =
+    next.filterMap(x => Try(x.toLong))
 
   val pDate: CommandLineParser[LocalDate] =
     read(s => LocalDate.parse(s, DateTimeFormatter.ISO_LOCAL_DATE))
@@ -79,28 +67,34 @@ object CommandLine {
     val parser: CommandLineParser[Config] = {
       val pAwsConcurentCalls =
         in(Set("-acc", "--aws-concurrent-calls"))
-          .andr(pPositiveLong)
+          .andr(pLong.filter(_ > 0L))
           .map(n => Config(_.copy(concurrentCalls = tag[AWSRateLimit](n))))
 
       val pAwsRetries =
         in(Set("-ar", "--aws-retries"))
-          .andr(pPositiveInt)
+          .andr(pInt.filter(_ > 0))
           .map(n => Config(_.copy(retries = tag[AWSRetries](n))))
 
       val pAwsChunkSize =
         in(Set("-acs", "--aws-chunk-size"))
-          .andr(pPositiveInt)
+          .andr(pInt.filter(_ > 0))
           .map(n => Config(_.copy(chunkSize = tag[AWSChunkSize](n))))
 
       val pAwsParallelism =
         in(Set("-ap", "--aws-parallelism"))
-          .andr(pPositiveInt)
+          .andr(pInt.filter(_ > 0))
           .map(n => Config(_.copy(parallelism = tag[AWSParallelism](n))))
+
+      val pAwsWaitOnError =
+        in(Set("-awoe", "--aws-wait-on-error"))
+          .andr(pInt.filter(_ >= 0))
+          .map { n => Config(_.copy(waitOnError = n.seconds)) }
 
       pAwsConcurentCalls
         .or(pAwsRetries)
         .or(pAwsChunkSize)
         .or(pAwsParallelism)
+        .or(pAwsWaitOnError)
         .between(None, None)
         .map(_.foldLeft(Config.empty)(_ + _))
     }
@@ -111,8 +105,22 @@ object CommandLine {
   }
   final case class Copy(config: Config, src: S3TableURL, dst: S3TableURL) extends CommandLine
   final case class Delete(config: Config, src: S3TableURL)                extends CommandLine
+  final case class Monitor(config: Config, items: List[Monitor.Item])     extends CommandLine
   final case class Error(error: Throwable) extends CommandLine {
     val config = Config.empty
+  }
+
+  object Monitor {
+    final case class Item(url: S3TableURL, csv: String, waitBetween: FiniteDuration)
+
+    object Item {
+      val parse: CommandLineParser[Item] =
+        for {
+          url         <- pS3TableURL
+          path        <- next
+          waitBetween <- pLong
+        } yield Item(url, path, waitBetween.seconds)
+    }
   }
 
   val parser: CommandLineParser[CommandLine] = {
@@ -131,11 +139,14 @@ object CommandLine {
     val pDelete: CommandLineParser[Config => CommandLine] =
       in(Set("delete")).andr(pS3TableURL).map(x => Delete(_, x))
 
+    val pMonitor: CommandLineParser[Config => CommandLine] =
+      in(Set("monitor")).andr(Monitor.Item.parse.between(None, None)).map(x => Monitor(_, x))
+
     pHelp
       .or {
         for {
           config <- Config.parser
-          f      <- pCopy.or(pDelete)
+          f      <- pCopy.or(pDelete).or(pMonitor)
         } yield f(config)
       }
       .andl(eof)
